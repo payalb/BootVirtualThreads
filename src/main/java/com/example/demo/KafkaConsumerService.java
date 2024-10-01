@@ -15,9 +15,15 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.env.Environment;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 
 @Service
 public class KafkaConsumerService {
@@ -41,6 +47,11 @@ public class KafkaConsumerService {
 	private int pauseDuration;
 	@Autowired
 	private Environment environment;
+	@Autowired
+	private MeterRegistry meterRegistry;
+
+	private Counter processedMessagesCounter;
+	private Counter errorMessagesCounter;
 
 	@Scheduled(fixedDelay = 5, timeUnit = TimeUnit.MINUTES) // Check every 5 minutes
 	public void refreshConsumerState() {
@@ -48,6 +59,14 @@ public class KafkaConsumerService {
 		isPaused = environment.getProperty("kafka.consumer.paused", Boolean.class, false);
 	}
 
+	@PostConstruct
+	public void init() {
+	    processedMessagesCounter = meterRegistry.counter("kafka.messages.processed");
+	    errorMessagesCounter = meterRegistry.counter("kafka.messages.errors");
+	}
+
+	
+	@KafkaListener(topics = "my-topic", groupId = "my-consumer-group")
 	public void listen() {
 		while (true) {
 			if (isPaused) {
@@ -67,7 +86,9 @@ public class KafkaConsumerService {
 			// Poll messages in batch
 			ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(pollDuration)); // Poll messages
 																										// every 1
-																										// second
+			  if (records.isEmpty()) {
+		            continue; // Skip iteration if no records
+		      }																							// second
 
 			// List to store all CompletableFutures for current batch
 			List<CompletableFuture<Void>> futures = new ArrayList<>();
@@ -97,6 +118,12 @@ public class KafkaConsumerService {
 		}
 	}
 
+	@PreDestroy
+	public void cleanup() {
+	    consumer.wakeup(); // This will unblock the consumer poll loop
+	    service.shutdown();
+	}
+	
 	private void retryMessage(ConsumerRecord<String, String> record) {
 		CompletableFuture.runAsync(() -> processMessage(record), service).exceptionally(ex -> {
 			System.out.println("Retry failed after second attempt, sending to Dead Letter Queue.");
@@ -110,9 +137,10 @@ public class KafkaConsumerService {
 	private void processMessage(ConsumerRecord<String, String> record) {
 		try {
 			System.out.println("Message processed: " + record.value());
+			processedMessagesCounter.increment();
 			// Message processing
 		} catch (Exception e) {
-
+			errorMessagesCounter.increment(); 
 			throw new RuntimeException("Processing failed", e); // Force retry logic
 
 		}
